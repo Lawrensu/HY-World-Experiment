@@ -1,0 +1,507 @@
+--- a/hyworld2/worldgen/gen_gs_data.py
++++ b/hyworld2/worldgen/gen_gs_data.py
+@@ -87,8 +87,9 @@
+     local_rank = int(os.getenv("LOCAL_RANK", 0))
+     device = torch.device(f"cuda:{local_rank}")
+     torch.cuda.set_device(local_rank)
++    # HY-World Windows patch: Windows torch has no NCCL, fall back to gloo
+     dist.init_process_group(
+-        backend="cpu:gloo,cuda:nccl",
++        backend="cpu:gloo,cuda:nccl" if dist.is_nccl_available() else "gloo",
+         rank=rank,
+         world_size=world_size,
+     )
+@@ -242,6 +243,8 @@
+                                glob(f"{scene_path}/render_results/reconstruct*/*/{result_name}_result.mp4") +
+                                glob(f"{scene_path}/render_results/wonder*/*/{result_name}_result.mp4"))
+ 
++        # HY-World Windows patch: glob returns backslashes on Windows, the splits below expect '/'
++        video_paths = [p.replace(os.sep, "/") for p in video_paths]
+         video_paths = sorted(video_paths, key=lambda x: (x.split("/")[-3], x.split("/")[-2]))
+         video_paths = video_paths[rank::world_size]
+ 
+@@ -387,7 +390,8 @@
+                 with open(f"{pano_bank_path}/cameras.json", "r") as f:
+                     pano_cameras = json.load(f)
+                 for i in tqdm(range(len(splitted_pano_list)), disable=rank != 0):
+-                    orig_fname = splitted_pano_list[i].split('/')[-1].split('.')[0]
++                    # HY-World Windows patch: glob returns backslashes on Windows
++                    orig_fname = os.path.basename(splitted_pano_list[i]).split('.')[0]
+                     fname = f"panorama_{orig_fname}"
+ 
+                     save_cameras[fname] = {
+@@ -518,7 +522,8 @@
+                     pano_cameras = json.load(f)
+ 
+                 for i in tqdm(range(len(splitted_pano_list)), disable=rank != 0):
+-                    orig_fname = splitted_pano_list[i].split('/')[-1].split('.')[0]
++                    # HY-World Windows patch: glob returns backslashes on Windows
++                    orig_fname = os.path.basename(splitted_pano_list[i]).split('.')[0]
+                     fname = f"polar_{orig_fname}"
+ 
+                     save_cameras[fname] = {
+--- a/hyworld2/worldgen/gs/extract_mesh.py
++++ b/hyworld2/worldgen/gs/extract_mesh.py
+@@ -119,7 +119,8 @@
+         elif ckpt_file.endswith(".ply"):
+             from plyfile import PlyData
+             import json
+-            meta_info = json.load(open("/".join(ckpt_file.split("/")[:-1]) + "/position_meta_info.json"))
++            # HY-World Windows patch: ckpt_file can hold backslashes on Windows
++            meta_info = json.load(open("/".join(ckpt_file.replace(os.sep, "/").split("/")[:-1]) + "/position_meta_info.json"))
+             up_direction = np.array(meta_info["up_direction"])
+             facing_direction = np.array(meta_info["facing_direction"])
+             center_point = np.array(meta_info["center_point"])
+--- a/hyworld2/worldgen/models/pipelines/pipeline_dmd_keyframe.py
++++ b/hyworld2/worldgen/models/pipelines/pipeline_dmd_keyframe.py
+@@ -12,6 +12,8 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
++# HY-World Windows patch: os is needed to read the low memory switch
++import os
+ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+ 
+ import torch
+@@ -59,7 +61,8 @@
+             transformer: WorldStereoRefSModel,
+             vae: AutoencoderKLWan,
+             scheduler,
+-            device,
++            # HY-World Windows patch: a default makes diffusers treat device as an option, not a model component, so offload can list components
++            device=None,
+             vae_compile: bool = False,
+             vae_compile_mode: str = "max-autotune"
+     ):
+@@ -334,6 +337,9 @@
+ 
+         # Offload all models
+         # self.maybe_free_model_hooks()
++        # HY-World Windows patch: model CPU offload needs this call to move the last model back to CPU
++        if os.environ.get("HYWORLD_LOWMEM") == "1":
++            self.maybe_free_model_hooks()
+ 
+         if not return_dict:
+             return (video,)
+--- a/hyworld2/worldgen/models/worldstereo_wrapper.py
++++ b/hyworld2/worldgen/models/worldstereo_wrapper.py
+@@ -103,6 +103,16 @@
+         return torch.float16
+     else:
+         return torch.float32
++
++
++# HY-World Windows patch: opt-in low memory mode for one 12 GB GPU, unset keeps the official behaviour
++def _lowmem() -> bool:
++    return os.environ.get("HYWORLD_LOWMEM") == "1"
++
++
++# HY-World Windows patch: torch.compile needs Triton, which the Windows torch build does not ship
++def _skip_compile() -> bool:
++    return _lowmem() or os.name == "nt"
+ 
+ 
+ class WorldStereo:
+@@ -205,6 +215,10 @@
+             local_files_only=local_files_only,
+         )
+ 
++        # HY-World Windows patch: diffusers CPU offload so the big model fits a 12 GB GPU
++        if _lowmem():
++            cls._enable_lowmem_offload(pipeline, device)
++
+         rank0_log(f"WorldStereo ({model_type}) ready.")
+         return cls(pipeline=pipeline, cfg=cfg)
+ 
+@@ -217,12 +231,36 @@
+         return self.pipeline(*args, **kwargs)
+ 
+     def to(self, device: torch.device) -> "WorldStereo":
++        # HY-World Windows patch: moving the pipeline would undo the CPU offload
++        if _lowmem():
++            return self
+         self.pipeline = self.pipeline.to(device)
+         return self
+ 
+     # ------------------------------------------------------------------
+     # Private helpers
+     # ------------------------------------------------------------------
++
++    # HY-World Windows patch: low memory mode, offload the pipeline models to CPU through diffusers
++    @staticmethod
++    def _enable_lowmem_offload(pipeline, device) -> None:
++        device = device if device is not None else torch.device("cuda")
++        mode = os.environ.get("HYWORLD_LOWMEM_OFFLOAD", "sequential").strip().lower()
++        if mode == "model":
++            rank0_log("Low memory mode: diffusers model CPU offload.")
++            pipeline.enable_model_cpu_offload(device=device)
++            return
++        rank0_log("Low memory mode: diffusers sequential CPU offload.")
++        pipeline.enable_sequential_cpu_offload(device=device)
++        # accelerate hooks leave non persistent buffers (for example rotary tables) on CPU, move them to the GPU
++        for component in pipeline.components.values():
++            if not isinstance(component, torch.nn.Module):
++                continue
++            for module in component.modules():
++                for name in module._non_persistent_buffers_set:
++                    buf = module._buffers.get(name)
++                    if buf is not None and buf.device.type == "cpu":
++                        module._buffers[name] = buf.to(device)
+ 
+     @staticmethod
+     def _load_hf_config(config_json_path: str) -> dict[str, Any]:
+@@ -320,6 +358,11 @@
+         _summarize_keys(result.unexpected_keys, "Unexpected keys")
+         _summarize_keys(result.missing_keys, "Missing keys")
+ 
++        # HY-World Windows patch: free the CPU copy of the checkpoint early in low memory mode
++        if _lowmem():
++            del weights, result
++            gc.collect()
++
+         if fsdp:
+             fsdp_kwargs = dict(
+                 mp_policy=MixedPrecisionPolicy(
+@@ -336,7 +379,8 @@
+                 fully_shard(layer, **fsdp_kwargs)
+             fully_shard(transformer, **fsdp_kwargs)
+             rank0_log("FSDP wrapping done for transformer.")
+-        else:
++        # HY-World Windows patch: keep the transformer on CPU in low memory mode, diffusers offload moves it
++        elif not _lowmem():
+             transformer = transformer.to(device=device)
+ 
+         gc.collect()
+@@ -350,18 +394,22 @@
+ 
+         # ---- text encoder ----
+         rank0_log("Loading TextEncoder (UMT5)…")
++        # HY-World Windows patch: bf16 text encoder in low memory mode, fp32 UMT5 does not fit RAM next to the transformer
+         text_encoder = UMT5EncoderModel.from_pretrained(
+-            cfg.base_model, subfolder="text_encoder", torch_dtype=torch.float32, local_files_only=local_files_only
++            cfg.base_model, subfolder="text_encoder", torch_dtype=torch.bfloat16 if _lowmem() else torch.float32, local_files_only=local_files_only
+         ).eval()
+         if _tr.__version__ >= "5.0.0":
+             rank0_log("Patching text_encoder.encoder.embed_tokens for transformers>=5.0.0", "WARNING")
+             text_encoder.encoder.embed_tokens = text_encoder.shared
+-        text_encoder = torch.compile(text_encoder)
++        # HY-World Windows patch: torch.compile needs Triton, skip it on Windows and in low memory mode
++        if not _skip_compile():
++            text_encoder = torch.compile(text_encoder)
+ 
+         # ---- image encoder ----
+         rank0_log("Loading ImageEncoder (CLIP)…")
++        # HY-World Windows patch: bf16 image encoder in low memory mode
+         image_clip = CLIPVisionModel.from_pretrained(
+-            cfg.base_model, subfolder="image_encoder", torch_dtype=torch.float32, local_files_only=local_files_only
++            cfg.base_model, subfolder="image_encoder", torch_dtype=torch.bfloat16 if _lowmem() else torch.float32, local_files_only=local_files_only
+         ).eval()
+         if _tr.__version__ >= "5.0.0":
+             rank0_log("Patching CLIP vision forward for transformers>=5.0.0", "WARNING")
+@@ -397,7 +445,9 @@
+         vae = AutoencoderKLWan.from_pretrained(
+             cfg.base_model, subfolder="vae", torch_dtype=vae_dtype, local_files_only=local_files_only
+         ).eval()
+-        vae = torch.compile(vae)
++        # HY-World Windows patch: torch.compile needs Triton, skip it on Windows and in low memory mode
++        if not _skip_compile():
++            vae = torch.compile(vae)
+ 
+         if fsdp:
+             fsdp_kwargs = dict(
+@@ -419,11 +469,14 @@
+ 
+             gc.collect()
+             torch.cuda.empty_cache()
+-        else:
++        # HY-World Windows patch: keep the encoders and the VAE on CPU in low memory mode, diffusers offload moves them
++        elif not _lowmem():
+             text_encoder = text_encoder.to(device=device)
+             image_clip = image_clip.to(device=device)
+ 
+-        vae = vae.to(device=device)
++        # HY-World Windows patch: same as above for the VAE
++        if not _lowmem():
++            vae = vae.to(device=device)
+         return text_encoder, image_clip, vae
+ 
+     @staticmethod
+--- a/hyworld2/worldgen/src/data_utils.py
++++ b/hyworld2/worldgen/src/data_utils.py
+@@ -29,6 +29,9 @@
+ 
+ def sort_trajs(scene_path):
+     # Generation order: (view*: up --> right --> left) --> target* --> reconstruct* --> wonder*
++    # HY-World Windows patch: glob returns backslashes on Windows, keep forward slashes in every path
++    from glob import glob as _glob
++    glob = lambda pattern: [p.replace(os.sep, '/') for p in _glob(pattern)]
+     view_paths = glob(f"{scene_path}/view*")
+     view_paths.sort()
+     view_list = []
+@@ -73,6 +76,8 @@
+     """
+     new_path_list = []
+     for old_path in path_list:
++        # HY-World Windows patch: accept backslash paths on Windows
++        old_path = old_path.replace(os.sep, '/')
+         parts = old_path.split('/')
+         dir_name = parts[-3]  # 3rd-to-last directory name
+         if '-' not in dir_name:
+--- a/hyworld2/worldgen/src/pointcloud.py
++++ b/hyworld2/worldgen/src/pointcloud.py
+@@ -179,12 +179,19 @@
+     pcd_renders = torch.cat(pcd_renders, dim=0).to(torch.float32)  # [f,3,h,w]
+     pcd_mask = torch.cat(pcd_mask, dim=0).to(torch.float32)  # [f,1,h,w]
+ 
+-    dist.barrier()
+-    dist.all_gather(gather_pcd_renders_r, pcd_renders[:, 0:1].contiguous())
+-    dist.all_gather(gather_pcd_renders_g, pcd_renders[:, 1:2].contiguous())
+-    dist.all_gather(gather_pcd_renders_b, pcd_renders[:, 2:3].contiguous())
+-    dist.all_gather(gather_pcd_mask, pcd_mask)
+-    dist.barrier()
++    # HY-World Windows patch: with one gloo process there is nothing to gather, avoid collectives on CUDA tensors
++    if dist.get_world_size() == 1 and dist.get_backend() == "gloo" and device_num == 1:
++        gather_pcd_renders_r[0].copy_(pcd_renders[:, 0:1])
++        gather_pcd_renders_g[0].copy_(pcd_renders[:, 1:2])
++        gather_pcd_renders_b[0].copy_(pcd_renders[:, 2:3])
++        gather_pcd_mask[0].copy_(pcd_mask)
++    else:
++        dist.barrier()
++        dist.all_gather(gather_pcd_renders_r, pcd_renders[:, 0:1].contiguous())
++        dist.all_gather(gather_pcd_renders_g, pcd_renders[:, 1:2].contiguous())
++        dist.all_gather(gather_pcd_renders_b, pcd_renders[:, 2:3].contiguous())
++        dist.all_gather(gather_pcd_mask, pcd_mask)
++        dist.barrier()
+ 
+     gather_pcd_renders_r = torch.cat(gather_pcd_renders_r, dim=0)
+     gather_pcd_renders_g = torch.cat(gather_pcd_renders_g, dim=0)
+--- a/hyworld2/worldgen/src/retrieval_wm.py
++++ b/hyworld2/worldgen/src/retrieval_wm.py
+@@ -2,6 +2,9 @@
+ import json
+ import math
+ import os
++# HY-World Windows patch: socket and sys are used to launch the WorldMirror subprocess
++import socket
++import sys
+ import subprocess
+ from concurrent.futures import ThreadPoolExecutor
+ from glob import glob
+@@ -786,6 +789,8 @@
+ 
+         def _load_item(args):
+             img_p, dep_p, cam_dict = args
++            # HY-World Windows patch: glob returns backslashes on Windows
++            img_p = img_p.replace(os.sep, '/')
+             key = img_p.split('/')[-1].split('.')[0]
+             view_id, traj_id = img_p.split('/')[-4], img_p.split('/')[-3]
+             fname = f"{view_id}/{traj_id}/{key}"
+@@ -1148,8 +1153,19 @@
+                     "--enable_bf16",
+                     "--disable_heads", "normal", "points", "gs"
+                 ]
++                # HY-World Windows patch: one process needs no FSDP, and its torchrun must not reuse the master port of this job
++                wm_cwd = ".."
++                if self.world_size == 1:
++                    wm_cmd.remove("--use_fsdp")
++                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as free_sock:
++                        free_sock.bind(("127.0.0.1", 0))
++                        wm_cmd.insert(2, f"--master_port={free_sock.getsockname()[1]}")
++                # HY-World Windows patch: torchrun may not be on PATH on Windows, and cwd must be the hyworld2 folder
++                if os.name == "nt":
++                    wm_cmd[0:1] = [sys.executable, "-m", "torch.distributed.run"]
++                    wm_cwd = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+                 color_print(f"[Rank0] Running World Mirror inference: {' '.join(wm_cmd)}", "info")
+-                result = subprocess.run(wm_cmd, cwd="..")
++                result = subprocess.run(wm_cmd, cwd=wm_cwd)
+ 
+                 if result.returncode != 0:
+                     raise RuntimeError(f"World Mirror inference failed with return code {result.returncode}")
+--- a/hyworld2/worldgen/src/sp_utils/parallel_states.py
++++ b/hyworld2/worldgen/src/sp_utils/parallel_states.py
+@@ -36,6 +36,10 @@
+ 
+     def build_mesh(self, device_type):
+         assert self.world_size % self.sp == 0, "world_size must be divisible by sp"
++        # HY-World Windows patch: a one process gloo run has no use for a device mesh, sp is off so it is never read
++        if self.world_size == 1 and dist.is_initialized() and dist.get_backend() == "gloo":
++            self.world_mesh = None
++            return None
+         mesh = init_device_mesh(
+             device_type,
+             [self.world_size // self.sp, self.sp],
+--- a/hyworld2/worldgen/traj_generate.py
++++ b/hyworld2/worldgen/traj_generate.py
+@@ -232,7 +232,8 @@
+         if not args.skip_exist and os.path.exists(f"{scene_path}/render_results"):
+             print(f"Delete existing {scene_path}/render_results")
+             render_results_list = glob(f"{scene_path}/render_results/*")
+-            render_results_list = [r for r in render_results_list if r.split('/')[-1] not in ("full_depth_prediction.pt", "global_mesh.ply",
++            # HY-World Windows patch: glob returns backslashes on Windows, split('/') would keep nothing and delete the cached files
++            render_results_list = [r for r in render_results_list if os.path.basename(r) not in ("full_depth_prediction.pt", "global_mesh.ply",
+                                                                                               "global_normal.npy", "global_pcd.ply", "sky_mask.png", "sky_pcd.ply")]
+             for path in render_results_list:
+                 if os.path.isdir(path):
+@@ -240,7 +241,8 @@
+                 else:
+                     os.remove(path)
+ 
+-        print(f"Stage1: Start regular trajectory generation for scene: {scene_path.split('/')[-1]}")
++        # HY-World Windows patch: scene_path can hold backslashes on Windows
++        print(f"Stage1: Start regular trajectory generation for scene: {os.path.basename(scene_path)}")
+ 
+         image_path = f"{scene_path}/panorama_sr.png" if os.path.exists(f"{scene_path}/panorama_sr.png") else f"{scene_path}/panorama.png"
+ 
+@@ -662,7 +664,8 @@
+ 
+         # ======================================== Stage2: Navmesh Trajectory Generation ========================================
+         if args.apply_nav_traj:
+-            print(f"Stage2: Start navigation trajectory generation for scene: {scene_path.split('/')[-1]}")
++            # HY-World Windows patch: scene_path can hold backslashes on Windows
++            print(f"Stage2: Start navigation trajectory generation for scene: {os.path.basename(scene_path)}")
+             camera_dir = f"{scene_path}/camera_trajectory"
+             os.makedirs(camera_dir, exist_ok=True)
+ 
+@@ -853,7 +856,8 @@
+             # NavMesh & Paths
+             try:
+                 is_outdoor = (meta_info.get("scene_type") == "outdoor")
+-                process_single_scene(scene_path, scene_path.split('/')[-1], global_mesh, args, segmentation_data, global_median_depth, is_outdoor=is_outdoor, timer=timer)
++                # HY-World Windows patch: scene_path can hold backslashes on Windows
++                process_single_scene(scene_path, os.path.basename(scene_path), global_mesh, args, segmentation_data, global_median_depth, is_outdoor=is_outdoor, timer=timer)
+             except Exception as e:
+                 rank0_log(f"  Navmesh Error: {e}", "ERROR")
+ 
+--- a/hyworld2/worldgen/traj_render.py
++++ b/hyworld2/worldgen/traj_render.py
+@@ -29,7 +29,8 @@
+ def caption_single_video(args):
+     """Caption one rendered video."""
+     render_path, llm_addr, llm_port, model_name = args
+-    output_path = render_path.replace('/render.mp4', '/traj_caption.json')
++    # HY-World Windows patch: render_path can hold backslashes on Windows
++    output_path = render_path.replace(os.sep, '/').replace('/render.mp4', '/traj_caption.json')
+ 
+     try:
+         traj_caption = get_traj_caption(llm_addr, llm_port, model_name, render_path)
+@@ -67,8 +68,9 @@
+     device = torch.device(f"cuda:{local_rank}")
+     device_num = torch.cuda.device_count()
+     torch.cuda.set_device(local_rank)
++    # HY-World Windows patch: Windows torch has no NCCL, fall back to gloo
+     dist.init_process_group(
+-        backend="cpu:gloo,cuda:nccl",
++        backend="cpu:gloo,cuda:nccl" if dist.is_nccl_available() else "gloo",
+         rank=rank,
+         world_size=world_size,
+     )
+@@ -85,6 +87,8 @@
+                      glob(f"{scene_path}/render_results/target*/traj*") +
+                      glob(f"{scene_path}/render_results/wonder*/traj*") +
+                      glob(f"{scene_path}/render_results/reconstruct*/traj*"))
++        # HY-World Windows patch: glob returns backslashes on Windows, the splits below expect '/'
++        traj_list = [p.replace(os.sep, '/') for p in traj_list]
+ 
+         rank0_log(f"Get {len(traj_list)} trajectories at all for {scene_path}")
+ 
+@@ -136,6 +140,8 @@
+         # Caption rendered trajectories with concurrent vLLM requests.
+         if rank == 0:
+             total_render_list = glob(f"{scene_path}/render_results/*/traj*/render.mp4")
++            # HY-World Windows patch: glob returns backslashes on Windows, the splits below expect '/'
++            total_render_list = [path.replace(os.sep, '/') for path in total_render_list]
+             total_render_list = [path for path in total_render_list if not (path.split("/")[-3].startswith("reconstruct_") and path.split("/")[-2] == "traj1")]
+ 
+             if total_render_list:
+--- a/hyworld2/worldgen/video_gen.py
++++ b/hyworld2/worldgen/video_gen.py
+@@ -50,15 +50,20 @@
+     local_rank = int(os.getenv("LOCAL_RANK", 0))
+     device = torch.device(f"cuda:{local_rank}")
+     torch.cuda.set_device(local_rank)
++    # HY-World Windows patch: Windows torch has no NCCL, fall back to gloo
+     dist.init_process_group(
+-        backend="cpu:gloo,cuda:nccl",
++        backend="cpu:gloo,cuda:nccl" if dist.is_nccl_available() else "gloo",
+         rank=rank,
+         world_size=world_size,
+     )
+     device_num = torch.cuda.device_count()
+     mesh_size = (world_size // device_num, device_num)
+     mesh_dims = ("rep", "shard")
+-    device_mesh = init_device_mesh("cuda", mesh_size, mesh_dim_names=mesh_dims)
++    # HY-World Windows patch: a one process gloo run has no use for a device mesh (only FSDP reads it)
++    if world_size == 1 and dist.get_backend() == "gloo" and not args.fsdp:
++        device_mesh = None
++    else:
++        device_mesh = init_device_mesh("cuda", mesh_size, mesh_dim_names=mesh_dims)
+ 
+     # == init logger ==
+     rank0_log(f"World size: {world_size}")
+@@ -124,11 +129,15 @@
+             # Generation order: (view*_up-->left-->right)-->wonder0,1,2...-->iter*
+             with timer.track("Sorting trajectories"):
+                 render_list = sort_trajs(f"{scene}/render_results")
+-
+-            rank0_log(f"Scene {scene.split('/')[-1]}: {len(render_list)} renderings found.")
++            # HY-World Windows patch: keep forward slashes, the splits below expect '/'
++            render_list = [p.replace(os.sep, '/') for p in render_list]
++
++            # HY-World Windows patch: scene can hold backslashes on Windows
++            rank0_log(f"Scene {os.path.basename(scene)}: {len(render_list)} renderings found.")
+ 
+             if os.path.exists(f"{scene}/render_results/generation_bank_{args.model_type}/aligned_pcd.ply") and args.skip_exist:
+-                rank0_log(f"Scene {scene.split('/')[-1]}: aligned_pcd.ply exists, skip.")
++                # HY-World Windows patch: scene can hold backslashes on Windows
++                rank0_log(f"Scene {os.path.basename(scene)}: aligned_pcd.ply exists, skip.")
+                 continue
+ 
+             width, height = imagesize.get(f"{'/'.join(render_list[0].split('/')[:-2])}/start_frame.png")
+--- a/hyworld2/worldgen/world_gs_trainer.py
++++ b/hyworld2/worldgen/world_gs_trainer.py
+@@ -1014,8 +1014,9 @@
+             self.trainset,
+             batch_size=cfg.batch_size,
+             shuffle=True,
+-            num_workers=4,
+-            persistent_workers=True,
++            # HY-World Windows patch: no worker processes on Windows, spawn is slow and fragile there
++            num_workers=0 if os.name == "nt" else 4,
++            persistent_workers=os.name != "nt",
+             pin_memory=True,
+         )
+         trainloader_iter = iter(trainloader)
+@@ -1373,8 +1374,9 @@
+                 )
+             if (step in ply_steps or step == max_steps - 1) and cfg.save_ply:
+                 # load scene-level meta info
+-                if os.path.exists(f"{'/'.join(cfg.data_dir.split('/')[:-1])}/meta_info.json"):
+-                    with open(f"{'/'.join(cfg.data_dir.split('/')[:-1])}/meta_info.json") as f:
++                # HY-World Windows patch: data_dir can hold backslashes on Windows
++                if os.path.exists(f"{'/'.join(cfg.data_dir.replace(os.sep, '/').split('/')[:-1])}/meta_info.json"):
++                    with open(f"{'/'.join(cfg.data_dir.replace(os.sep, '/').split('/')[:-1])}/meta_info.json") as f:
+                         scene_type = json.load(f)["scene_type"]
+                 elif os.path.exists(f"{cfg.data_dir}/meta_info.json"):
+                     with open(f"{cfg.data_dir}/meta_info.json") as f:
+@@ -1893,7 +1895,8 @@
+         device = self.device
+         world_rank = self.world_rank
+ 
+-        valloader = torch.utils.data.DataLoader(self.valset, batch_size=1, shuffle=False, num_workers=1)
++        # HY-World Windows patch: no worker processes on Windows, spawn is slow and fragile there
++        valloader = torch.utils.data.DataLoader(self.valset, batch_size=1, shuffle=False, num_workers=0 if os.name == "nt" else 1)
+ 
+         ellipse_time = 0
+         metrics = defaultdict(list)
+@@ -2282,8 +2285,9 @@
+             self.trainset,
+             batch_size=cfg.batch_size,
+             shuffle=True,
+-            num_workers=4,
+-            persistent_workers=True,
++            # HY-World Windows patch: no worker processes on Windows, spawn is slow and fragile there
++            num_workers=0 if os.name == "nt" else 4,
++            persistent_workers=os.name != "nt",
+             pin_memory=True,
+         )
+         trainloader_iter = iter(trainloader)
