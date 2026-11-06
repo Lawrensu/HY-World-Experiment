@@ -1,0 +1,8 @@
+# Made by the setup and the runs on the lab PC, never committed
+HY-World-2.0/
+tools/
+tmp/
+hf_cache/
+runs/
+logs/
+__pycache__/

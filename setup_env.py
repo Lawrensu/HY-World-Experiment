@@ -702,6 +702,31 @@ def apply_worldgen_patch(repo, patch_path=None):
     print(f"  applied the patch to {len(files)} file(s)")
 
 
+def build_navmesh_short_path(navmesh_dir, recast_dir):
+    """Run the official navmesh install from a short copy of its folders.
+
+    navmesh's setup.py passes the recastnavigation sources as absolute paths, and setuptools
+    repeats that whole path under build\\temp. Inside a deep folder (for example the Desktop)
+    the object file path goes past the 260 character limit, which needs admin rights to lift,
+    and cl fails with "Cannot open compiler generated file". setup.py reads RECAST_PATH, so
+    point it at a short copy and build there. pip installs the module into the env, so the copy
+    is deleted afterwards.
+    """
+    short = Path(os.environ.get("USERPROFILE") or Path.home()) / "hywb"
+    if short.exists():
+        shutil.rmtree(short)
+    junk = shutil.ignore_patterns("build", "*.egg-info", "__pycache__", ".git")
+    shutil.copytree(navmesh_dir, short / "navmesh", ignore=junk)
+    shutil.copytree(recast_dir, short / "recastnavigation", ignore=junk)
+    print(f"  building from the short path {short}")
+    env = dict(os.environ, RECAST_PATH=str(short / "recastnavigation"))
+    # Official command, run in the copy.
+    pip_or_fail("install", ".", "--no-build-isolation", cwd=short / "navmesh", env=env)
+    shutil.rmtree(short, ignore_errors=True)
+    if run_py("import recast", cwd=sys.prefix).returncode != 0:
+        fail("navmesh was installed but import recast fails")
+
+
 def provide_zlib_source():
     """Give spz's CMake FetchContent the zlib source it pins, from a link that still works."""
     if not (ZLIB_DIR / "zlib.h").exists():
@@ -884,8 +909,7 @@ def setup_worldgen(repo):
     if run_py("import recast", cwd=sys.prefix).returncode == 0:
         print("  OK, already done")
     else:
-        # Official command. setup.py finds recastnavigation at its default relative path.
-        pip_or_fail("install", ".", "--no-build-isolation", cwd=repo / NAVMESH_REL)
+        build_navmesh_short_path(repo / NAVMESH_REL, recast_dir)
 
     step(8, total, "gsplat_maskgaussian with CUDA kernels (official build, needed by 3DGS training)")
     # The worldgen README says gsplat_maskgaussian must be compiled from source. The recon
