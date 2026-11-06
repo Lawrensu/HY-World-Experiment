@@ -602,6 +602,11 @@ def set_build_env():
         # installed Visual Studio and cannot use the portable MSVC. Ninja uses cl from PATH.
         CMAKE_GENERATOR="Ninja",
     )
+    # The conda CUDA compiler pulls in conda-forge's Visual Studio activation, which sets a
+    # Visual Studio platform and toolset for CMake. Ninja rejects those ("does not support
+    # platform specification"), so drop them.
+    for var in ("CMAKE_GENERATOR_PLATFORM", "CMAKE_GENERATOR_TOOLSET", "CMAKE_GENERATOR_INSTANCE"):
+        os.environ.pop(var, None)
     # The recon mode builds gsplat without kernels; the world generation build needs them.
     os.environ.pop("BUILD_NO_CUDA", None)
     prepend_path("PATH", [lib / "bin", lib / "cmd"])
