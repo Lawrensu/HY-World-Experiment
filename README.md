@@ -182,6 +182,7 @@ python -m world_gs_trainer default --data_dir %TARGET_PATH%\gs_data --result_dir
 * Stage 3 low memory mode, only with `HYWORLD_LOWMEM=1`: CPU offload, bf16 text and image encoders, no `torch.compile`
 * Build tools without admin: portable MSVC 14.44 and the conda CUDA 12.8 compiler instead of Visual Studio and the CUDA installer
 * gsplat glm headers at the commit gsplat 1.5.3 pins, because the HY-World copy leaves them out
-* CMake from pip, because spz needs it
+* CMake and Ninja from pip, because spz needs CMake. CMake uses the Ninja generator, because its default Visual Studio generator needs an installed Visual Studio
+* zlib 1.3.1 for spz from zlib's GitHub release, checked against the hash spz pins, because spz's zlib.net link is dead
 * VLM: Qwen3-VL-8B in Qwen's official FP8 version, served by the community Windows build of vLLM 0.32.0 with CPU offload
 * `torchrun --nproc_per_node 1` and no `--fsdp`, because there is one GPU

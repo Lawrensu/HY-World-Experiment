@@ -60,6 +60,11 @@ MSVC_SCRIPT_URL = (
 )
 MSVC_SCRIPT_SHA256 = "1791cccca594ff083ce8d3e0a139e6156d2c312e24332a909e608010f0230a51"
 MSVC_SCRIPT_PATH = TOOLS_DIR / "portable-msvc.py"
+# spz (requirements_git.txt) downloads zlib 1.3.1 from zlib.net when it finds no zlib, and that
+# link is dead. zlib's own GitHub release has the same file, with the hash spz pins.
+ZLIB_URL = "https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz"
+ZLIB_SHA256 = "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+ZLIB_DIR = TOOLS_DIR / "zlib-1.3.1"
 MSVC_VERSION = "14.44"  # the newest toolset CUDA 12.8 supports
 
 # vLLM for Windows (community build by SystemPanic). Needs CUDA 13, so NVIDIA driver R580+.
@@ -593,6 +598,9 @@ def set_build_env():
         MSSdk="1",
         TORCH_CUDA_ARCH_LIST="12.0",
         FORCE_CUDA="1",
+        # CMake (spz) defaults to the Visual Studio generator on Windows, which looks for an
+        # installed Visual Studio and cannot use the portable MSVC. Ninja uses cl from PATH.
+        CMAKE_GENERATOR="Ninja",
     )
     # The recon mode builds gsplat without kernels; the world generation build needs them.
     os.environ.pop("BUILD_NO_CUDA", None)
@@ -687,6 +695,24 @@ def apply_worldgen_patch(repo, patch_path=None):
             "  git may have skipped files because the folder is inside another git repository."
         )
     print(f"  applied the patch to {len(files)} file(s)")
+
+
+def provide_zlib_source():
+    """Give spz's CMake FetchContent the zlib source it pins, from a link that still works."""
+    if not (ZLIB_DIR / "zlib.h").exists():
+        TOOLS_DIR.mkdir(exist_ok=True)
+        archive = TOOLS_DIR / "zlib-1.3.1.tar.gz"
+        download_verified(ZLIB_URL, archive, ZLIB_SHA256)
+        if subprocess.run(["tar", "-xzf", str(archive), "-C", str(TOOLS_DIR)]).returncode != 0:
+            fail(f"could not extract {archive}")
+        if not (ZLIB_DIR / "zlib.h").exists():
+            fail(f"zlib.h not found in {ZLIB_DIR} after extracting")
+    # Only used if spz has to fetch zlib; a zlib found in the env takes priority, as upstream.
+    arg = f"-DFETCHCONTENT_SOURCE_DIR_ZLIB={ZLIB_DIR.as_posix()}"
+    current = os.environ.get("CMAKE_ARGS", "")
+    if arg not in current:
+        os.environ["CMAKE_ARGS"] = f"{current} {arg}".strip()
+    print(f"  zlib source for spz: {ZLIB_DIR}")
 
 
 def gsplat_has_kernels():
@@ -840,9 +866,12 @@ def setup_worldgen(repo):
         print("  (often 20 to 60 minutes) and the window can look stuck. Let it run.")
         # With --no-build-isolation pip uses the build tools already in the env.
         # requirements.txt brings scikit-build-core, nanobind and pybind11, but spz also needs
-        # CMake, which upstream expects on the system. Install it from pip (no admin).
-        if not module_available("cmake"):
-            pip_or_fail("install", "cmake")
+        # CMake, which upstream expects on the system, and Ninja for the generator set in
+        # set_build_env. Install them from pip (no admin).
+        missing = [m for m in ("cmake", "ninja") if not module_available(m)]
+        if missing:
+            pip_or_fail("install", *missing)
+        provide_zlib_source()
         pip_or_fail("install", "--no-build-isolation", "-r", str(req_git))
         marker.write_text(sha256_of(req_git) + "\n")
 

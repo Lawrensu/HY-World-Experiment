@@ -173,6 +173,8 @@ set "DISTUTILS_USE_SDK=1"
 set "MSSdk=1"
 set "TORCH_CUDA_ARCH_LIST=12.0"
 set "USE_LIBUV=0"
+rem CMake builds must use Ninja: the Visual Studio generator needs an installed Visual Studio.
+set "CMAKE_GENERATOR=Ninja"
 rem Windows defaults to cp1252. UTF-8 keeps reading meta_info.json and printing paths safe.
 set "PYTHONUTF8=1"
 cd /d "%REPO%\hyworld2\worldgen"
