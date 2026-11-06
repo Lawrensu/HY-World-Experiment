@@ -1,0 +1,6 @@
+# Keep line endings fixed whatever core.autocrlf says on the PC that clones this repo.
+# The patch must stay LF to match the LF files of the upstream ZIP. cmd needs CRLF batch files.
+*.patch text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.bat text eol=crlf

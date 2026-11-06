@@ -599,7 +599,12 @@ def set_build_env():
     prepend_path("PATH", [lib / "bin", lib / "cmd"])
     # conda-forge puts the CUDA headers in Library\include and the .lib files in Library\lib.
     # torch only adds CUDA_HOME\lib\x64 to the linker, so add both through INCLUDE and LIB.
-    prepend_path("INCLUDE", [lib / "include"])
+    # The CCCL headers (cuda/std/..., nv/target) sit in Library\include\targets\x64 on
+    # conda-forge for Windows. nvcc finds them through its own profile, but cl, which compiles
+    # the .cpp files, only sees INCLUDE. CUDA 13 moves them one level down into cccl.
+    prepend_path("INCLUDE", [lib / "include",
+                             lib / "include" / "targets" / "x64",
+                             lib / "include" / "targets" / "x64" / "cccl"])
     prepend_path("LIB", [lib / "lib", lib / "lib" / "x64"])
 
 
@@ -635,6 +640,15 @@ def git_run(repo, *args):
     )
 
 
+def lf_copy_of_patch(patch_path):
+    """A git checkout with core.autocrlf=true turns the patch into CRLF, which then no
+    longer matches the LF files from the upstream ZIP. Apply an LF copy instead."""
+    TOOLS_DIR.mkdir(exist_ok=True)
+    out = TOOLS_DIR / "worldgen_windows.lf.patch"
+    out.write_bytes(Path(patch_path).read_bytes().replace(b"\r\n", b"\n"))
+    return out
+
+
 def apply_worldgen_patch(repo, patch_path=None):
     patch_path = Path(patch_path or PATCH_PATH)
     if not patch_path.is_file():
@@ -642,15 +656,28 @@ def apply_worldgen_patch(repo, patch_path=None):
     files = patch_target_files(read_text(patch_path))
     if not files:
         fail(f"no '+++ b/...' lines found in {patch_path}")
-    patch = str(patch_path)
-    if git_run(repo, "apply", "--check", "-R", patch).returncode == 0 \
+    patch = str(lf_copy_of_patch(patch_path))
+    # The second variant ignores whitespace in the context lines, which covers an upstream
+    # copy whose files got CRLF endings (for example a git clone with core.autocrlf=true).
+    variants = [[], ["--ignore-whitespace"]]
+    if any(git_run(repo, "apply", *v, "--check", "-R", patch).returncode == 0 for v in variants) \
             and not files_missing_marker(repo, files):
         print("  OK, already done")
         return
-    r = git_run(repo, "apply", "--check", patch)
-    if r.returncode != 0:
-        fail(f"the patch does not apply to {repo} (upstream changed, or half applied):\n{r.stderr}")
-    r = git_run(repo, "apply", patch)
+    chosen, errors = None, []
+    for v in variants:
+        r = git_run(repo, "apply", *v, "--check", patch)
+        if r.returncode == 0:
+            chosen = v
+            break
+        errors.append(r.stderr.strip())
+    if chosen is None:
+        fail(
+            f"the patch does not apply to {repo} (upstream changed, or half applied).\n"
+            "  If an earlier run stopped halfway, delete the HY-World-2.0 folder and run the setup again,\n"
+            "  it downloads a fresh copy. git said:\n" + "\n".join(errors[-1:])
+        )
+    r = git_run(repo, "apply", *chosen, patch)
     if r.returncode != 0:
         fail(f"git apply failed:\n{r.stderr}")
     missing = files_missing_marker(repo, files)
